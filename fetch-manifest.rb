@@ -10,11 +10,12 @@ if ARGV.size < 1
   exit 1
 end
 
-path = ARGV[0] # Required. Example: some/repo/manifest/default.xml
-more = ARGV[1] # Optional. Example: some/override.xml
-emit = ARGV[2] # Optional. Example: output/changes-since-last-fetch.txt
-oxml = ARGV[3] # Optional. Example: output/build-manifest.xml -- usable as input to repo tool.
-volt = ARGV[4] # Optional. voltron revision, to be in emitted manifest
+path = ARGV[0]       # Required. Example: some/repo/manifest/default.xml
+more = ARGV[1] || "" # Optional. Example: some/override.xml
+emit = ARGV[2] || "" # Optional. Example: output/changes-since-last-fetch.txt
+oxml = ARGV[3] || "" # Optional. Example: output/build-manifest.xml -- usable as input to repo tool.
+volt = ARGV[4] || "" # Optional. voltron revision, to be in emitted manifest
+cachedir = ARGV[5] || "" # Optional. Will be used as a local git cache to speed subsequent downloads.
 
 root = REXML::Document.new(File.new(path)).root
 
@@ -37,7 +38,7 @@ end
 # An override.xml file can be useful to specify different remote
 # servers, such as to a closer, local git mirror.
 #
-if more
+if more != ""
   more_root = REXML::Document.new(File.new(more)).root
   more_root.each_element("//remote") do |remote|
     unless remotes[remote.attributes['name']]
@@ -57,32 +58,60 @@ changes = {}
 
 projects_arr.each do |name|
   project  = projects[name]
-  path     = project.attributes['path'] || project.attributes['name']
+  path     = project.attributes['path'] || name
   remote   = remotes[project.attributes['remote'] || default.attributes['remote']]
+  remote_name = remote.attributes['name']
   fetch    = remote.attributes['fetch']
   revision = project.attributes['revision'] || default.attributes['revision']
+  project_url = "#{fetch}#{name}"
 
-  print "#{name} #{revision}...\n"
+  print "#{name} #{revision} #{remote}...\n"
 
-  unless File.directory?("#{path}/.git")
-    sh %{git clone #{fetch}#{name} #{path}} do |ok, res|
-      exit(false) unless ok
-    end
-  else
-    Dir.chdir(path) do
-      sh %{git remote update} do |ok, res|
+  # If caching, update the cache first, then change URL to
+  # point to the cache
+  if cachedir != ""
+    safe_fetch = fetch.chomp("/").tr_s("/:","_")
+    project_cachedir = "#{cachedir}/#{safe_fetch}/#{name}.git"
+    unless File.directory?(project_cachedir)
+      sh %{git clone --bare #{fetch}#{name} #{project_cachedir}} do |ok, res|
         exit(false) unless ok
       end
+    end
+    sh %{git --git-dir #{project_cachedir} fetch #{project_url} '+refs/*:refs/*' --prune}
+    project_url = project_cachedir
+  end
+
+  # Create local source directory if necessary
+  unless File.directory?("#{path}/.git")
+    sh %{git clone --origin #{remote_name} #{project_url} #{path}} do |ok, res|
+      exit(false) unless ok
     end
   end
 
   Dir.chdir(path) do
-    curr = `git rev-parse HEAD`.chomp
+    # See if remote is known
+    rem = %x{git config --file .git/config --get remote.#{remote_name}.url}.chomp()
+    if rem == ""
+      # Unknown; add remote
+      sh %{git remote add #{remote_name} #{project_url} } do |ok, res|
+        exit(false) unless ok
+      end
+    elsif rem != project_url
+      print "ERROR! You changed the URL for remote #{remote_name}.\n"
+      print "It was previously #{rem}\n"
+      print "and is now #{project_url}\n"
+      print "fetch-manifest.rb cannot handle this! Please use a new name.\n\n"
+      exit (false)
+    end
 
-    sh %{git fetch --tags} do |ok, res|
+    # Update git information
+    sh %{git fetch #{remote_name} && git fetch --tags #{remote_name}} do |ok, res|
       exit(false) unless ok
     end
 
+    curr = `git rev-parse HEAD`.chomp
+
+    # Checkout a particular revision
     if revision.include?(' ')
       # Handle when the revision attribute is a full command, like...
       #
@@ -96,7 +125,7 @@ projects_arr.each do |name|
         exit(false) unless ok
       end
     else
-      sh %{git reset --hard origin/#{revision} || git reset --hard #{revision}} do |ok, res|
+      sh %{git reset --hard #{remote_name}/#{revision} || git reset --hard #{revision}} do |ok, res|
         exit(false) unless ok
       end
     end
@@ -113,7 +142,7 @@ projects_arr.each do |name|
   end
 end
 
-if emit
+if emit != ""
   result = []
   changes.keys.sort.each do |name|
     result << "=================="
@@ -125,7 +154,7 @@ if emit
   File.open(emit, 'w') {|o| o.write(result)} unless emit == '--'
 end
 
-if oxml
+if oxml != ""
   # Optionally emit a manifest.xml that can be used as input to
   # the repo / fetch-manifest.rb tool.
   #
@@ -168,7 +197,7 @@ if oxml
         end
       end
     end
-    if volt
+    if volt != ""
        o.write "  <!--\n  <project name=\"voltron\" path=\"voltron\" revision=\"#{volt}\" />\n  -->"
     end
     o.write "</manifest>\n"
